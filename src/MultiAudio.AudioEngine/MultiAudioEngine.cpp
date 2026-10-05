@@ -15,7 +15,6 @@
 #pragma comment(lib, "mmdevapi.lib")
 #pragma comment(lib, "ole32.lib")
 
-// Internal audio format (48kHz, 32-bit float, Stereo)
 const int SAMPLE_RATE = 48000;
 const int CHANNELS = 2;
 const int BYTES_PER_SAMPLE = sizeof(float);
@@ -23,11 +22,11 @@ const int BYTES_PER_SAMPLE = sizeof(float);
 struct OutputDevice {
     std::wstring id;
     std::wstring name;
-    bool enabled = false;
-    float volume = 1.0f;
-    int delayMs = 0;
+    std::atomic<bool> enabled{false};
+    std::atomic<float> volume{1.0f};
+    std::atomic<int> delayMs{0};
     
-    // Audio engine components
+    // Core engine state
     IMMDevice* pDevice = nullptr;
     IAudioClient* pAudioClient = nullptr;
     IAudioRenderClient* pRenderClient = nullptr;
@@ -35,14 +34,19 @@ struct OutputDevice {
     
     std::thread renderThread;
     std::atomic<bool> isRendering{false};
+    std::atomic<bool> deviceFailed{false};
 };
 
-// Globals
 std::vector<std::shared_ptr<OutputDevice>> g_devices;
 IMMDeviceEnumerator* g_pEnumerator = nullptr;
 std::mutex g_engineMutex;
 
-// Capture Globals
+// Master Pipeline
+std::unique_ptr<RingBuffer> g_masterBuffer;
+std::thread g_routerThread;
+std::atomic<bool> g_isRouting{false};
+
+// Capture
 IMMDevice* g_pCaptureDevice = nullptr;
 IAudioClient* g_pCaptureClient = nullptr;
 IAudioCaptureClient* g_pCaptureRenderClient = nullptr; 
@@ -51,6 +55,8 @@ std::atomic<bool> g_isCapturing{false};
 
 void RenderThreadProc(std::shared_ptr<OutputDevice> pDev);
 void CaptureThreadProc();
+void RouterThreadProc();
+bool TryInitializeDevice(std::shared_ptr<OutputDevice> pDev);
 
 void InitializeEngine() {
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
@@ -61,6 +67,8 @@ void InitializeEngine() {
         (void**)&g_pEnumerator);
         
     if (FAILED(hr)) return;
+    
+    g_masterBuffer = std::make_unique<RingBuffer>(SAMPLE_RATE * CHANNELS * 2); // 2 seconds
     
     IMMDeviceCollection* pCollection = nullptr;
     hr = g_pEnumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &pCollection);
@@ -84,10 +92,8 @@ void InitializeEngine() {
                             auto dev = std::make_shared<OutputDevice>();
                             dev->id = pwszID;
                             dev->name = varName.pwszVal;
-                            
-                            // Initialize ring buffer for 1 second of audio (48000 samples * 2 channels)
-                            dev->ringBuffer = std::make_unique<RingBuffer>(SAMPLE_RATE * CHANNELS);
-                            
+                            // 2 seconds buffer for delay compensation
+                            dev->ringBuffer = std::make_unique<RingBuffer>(SAMPLE_RATE * CHANNELS * 2); 
                             g_devices.push_back(dev);
                             PropVariantClear(&varName);
                         }
@@ -112,6 +118,7 @@ void ShutdownEngine() {
         g_pEnumerator->Release();
         g_pEnumerator = nullptr;
     }
+    g_masterBuffer.reset();
     CoUninitialize();
 }
 
@@ -138,54 +145,38 @@ void StartRouting() {
     std::lock_guard<std::mutex> lock(g_engineMutex);
     if (g_isCapturing) return;
 
-    // Start Capture
-    HRESULT hr = g_pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &g_pCaptureDevice);
-    if (FAILED(hr)) return;
-
-    hr = g_pCaptureDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&g_pCaptureClient);
-    if (FAILED(hr)) return;
-
-    WAVEFORMATEX* pwfx = nullptr;
-    hr = g_pCaptureClient->GetMixFormat(&pwfx);
-    if (FAILED(hr)) return;
+    g_masterBuffer->Clear();
     
-    hr = g_pCaptureClient->Initialize(
-        AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_LOOPBACK,
-        10000000, 
-        0,
-        pwfx,
-        NULL);
-        
-    if (FAILED(hr)) {
-        CoTaskMemFree(pwfx);
-        return;
-    }
-
-    hr = g_pCaptureClient->GetService(__uuidof(IAudioCaptureClient), (void**)&g_pCaptureRenderClient);
-    if (FAILED(hr)) return;
-
+    g_isRouting = true;
     g_isCapturing = true;
-    g_captureThread = std::thread(CaptureThreadProc);
     
-    // Start Outputs
+    g_captureThread = std::thread(CaptureThreadProc);
+    g_routerThread = std::thread(RouterThreadProc);
+    
     for (auto& dev : g_devices) {
         if (dev->enabled && !dev->isRendering) {
             dev->isRendering = true;
+            dev->deviceFailed = false;
             dev->ringBuffer->Clear();
+            
+            // Pre-fill ring buffer with 'delay' amount of silence
+            int delaySamples = (dev->delayMs * SAMPLE_RATE / 1000) * CHANNELS;
+            if (delaySamples > 0) {
+                std::vector<float> zeros(delaySamples, 0.0f);
+                dev->ringBuffer->Write(zeros.data(), delaySamples);
+            }
+            
             dev->renderThread = std::thread(RenderThreadProc, dev);
         }
     }
-    
-    CoTaskMemFree(pwfx);
 }
 
 void StopRouting() {
     g_isCapturing = false;
+    g_isRouting = false;
     
-    if (g_captureThread.joinable()) {
-        g_captureThread.join();
-    }
+    if (g_captureThread.joinable()) g_captureThread.join();
+    if (g_routerThread.joinable()) g_routerThread.join();
     
     std::lock_guard<std::mutex> lock(g_engineMutex);
     for (auto& dev : g_devices) {
@@ -193,19 +184,6 @@ void StopRouting() {
         if (dev->renderThread.joinable()) {
             dev->renderThread.join();
         }
-    }
-    
-    if (g_pCaptureRenderClient) {
-        g_pCaptureRenderClient->Release();
-        g_pCaptureRenderClient = nullptr;
-    }
-    if (g_pCaptureClient) {
-        g_pCaptureClient->Release();
-        g_pCaptureClient = nullptr;
-    }
-    if (g_pCaptureDevice) {
-        g_pCaptureDevice->Release();
-        g_pCaptureDevice = nullptr;
     }
 }
 
@@ -216,10 +194,18 @@ void SetOutputEnabled(const wchar_t* deviceId, bool enabled) {
             if (dev->enabled != enabled) {
                 dev->enabled = enabled;
                 
-                if (g_isCapturing) {
+                if (g_isRouting) {
                     if (enabled && !dev->isRendering) {
                         dev->isRendering = true;
+                        dev->deviceFailed = false;
                         dev->ringBuffer->Clear();
+                        
+                        int delaySamples = (dev->delayMs * SAMPLE_RATE / 1000) * CHANNELS;
+                        if (delaySamples > 0) {
+                            std::vector<float> zeros(delaySamples, 0.0f);
+                            dev->ringBuffer->Write(zeros.data(), delaySamples);
+                        }
+                        
                         dev->renderThread = std::thread(RenderThreadProc, dev);
                     } else if (!enabled && dev->isRendering) {
                         dev->isRendering = false;
@@ -235,7 +221,6 @@ void SetOutputEnabled(const wchar_t* deviceId, bool enabled) {
 }
 
 void SetOutputVolume(const wchar_t* deviceId, float volume) {
-    std::lock_guard<std::mutex> lock(g_engineMutex);
     for (auto& dev : g_devices) {
         if (dev->id == deviceId) {
             dev->volume = volume;
@@ -245,9 +230,10 @@ void SetOutputVolume(const wchar_t* deviceId, float volume) {
 }
 
 void SetOutputDelay(const wchar_t* deviceId, int delayMs) {
-    std::lock_guard<std::mutex> lock(g_engineMutex);
     for (auto& dev : g_devices) {
         if (dev->id == deviceId) {
+            // Delay updates will apply on next stream restart or dynamically by injecting/removing zeros
+            // For MVP, we will only apply at stream start, but let's store it.
             dev->delayMs = delayMs;
             break;
         }
@@ -257,69 +243,135 @@ void SetOutputDelay(const wchar_t* deviceId, int delayMs) {
 void CaptureThreadProc() {
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
     
-    g_pCaptureClient->Start();
-    
-    WAVEFORMATEX* pwfx = nullptr;
-    g_pCaptureClient->GetMixFormat(&pwfx);
-    
-    UINT32 packetLength = 0;
     while (g_isCapturing) {
-        Sleep(5);
+        HRESULT hr = g_pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &g_pCaptureDevice);
+        if (FAILED(hr)) {
+            Sleep(1000);
+            continue;
+        }
+
+        hr = g_pCaptureDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&g_pCaptureClient);
+        if (FAILED(hr)) {
+            g_pCaptureDevice->Release(); g_pCaptureDevice = nullptr;
+            Sleep(1000);
+            continue;
+        }
+
+        WAVEFORMATEX* pwfx = nullptr;
+        hr = g_pCaptureClient->GetMixFormat(&pwfx);
         
-        HRESULT hr = g_pCaptureRenderClient->GetNextPacketSize(&packetLength);
-        if (FAILED(hr)) continue;
-        
-        while (packetLength != 0) {
-            BYTE* pData;
-            UINT32 numFramesAvailable;
-            DWORD flags;
+        hr = g_pCaptureClient->Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_LOOPBACK,
+            10000000, 
+            0,
+            pwfx,
+            NULL);
             
-            hr = g_pCaptureRenderClient->GetBuffer(
-                &pData,
-                &numFramesAvailable,
-                &flags,
-                NULL,
-                NULL);
-                
-            if (SUCCEEDED(hr)) {
-                if (pwfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
-                    float* pFloatData = (float*)pData;
-                    size_t sampleCount = numFramesAvailable * pwfx->nChannels;
-                    
-                    std::vector<float> zeros(sampleCount, 0.0f);
-                    float* pWriteData = (flags & AUDCLNT_BUFFERFLAGS_SILENT) ? zeros.data() : pFloatData;
-                    
-                    std::lock_guard<std::mutex> lock(g_engineMutex);
-                    for (auto& dev : g_devices) {
-                        if (dev->enabled && dev->isRendering) {
-                            dev->ringBuffer->Write(pWriteData, sampleCount);
-                        }
-                    }
-                }
-                
-                g_pCaptureRenderClient->ReleaseBuffer(numFramesAvailable);
-            }
+        if (FAILED(hr)) {
+            CoTaskMemFree(pwfx);
+            g_pCaptureClient->Release(); g_pCaptureClient = nullptr;
+            g_pCaptureDevice->Release(); g_pCaptureDevice = nullptr;
+            Sleep(1000);
+            continue;
+        }
+
+        hr = g_pCaptureClient->GetService(__uuidof(IAudioCaptureClient), (void**)&g_pCaptureRenderClient);
+        g_pCaptureClient->Start();
+        
+        UINT32 packetLength = 0;
+        bool deviceInvalidated = false;
+        
+        while (g_isCapturing && !deviceInvalidated) {
+            Sleep(5);
             
             hr = g_pCaptureRenderClient->GetNextPacketSize(&packetLength);
+            if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+                deviceInvalidated = true;
+                break;
+            }
+            if (FAILED(hr)) continue;
+            
+            while (packetLength != 0) {
+                BYTE* pData;
+                UINT32 numFramesAvailable;
+                DWORD flags;
+                
+                hr = g_pCaptureRenderClient->GetBuffer(&pData, &numFramesAvailable, &flags, NULL, NULL);
+                if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+                    deviceInvalidated = true;
+                    break;
+                }
+                    
+                if (SUCCEEDED(hr)) {
+                    if (pwfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+                        float* pFloatData = (float*)pData;
+                        size_t sampleCount = numFramesAvailable * pwfx->nChannels;
+                        
+                        std::vector<float> zeros(sampleCount, 0.0f);
+                        float* pWriteData = (flags & AUDCLNT_BUFFERFLAGS_SILENT) ? zeros.data() : pFloatData;
+                        
+                        // Write to Master Buffer
+                        g_masterBuffer->Write(pWriteData, sampleCount);
+                    }
+                    g_pCaptureRenderClient->ReleaseBuffer(numFramesAvailable);
+                }
+                
+                hr = g_pCaptureRenderClient->GetNextPacketSize(&packetLength);
+            }
         }
+        
+        // Cleanup on invalidation to restart
+        g_pCaptureClient->Stop();
+        if (g_pCaptureRenderClient) { g_pCaptureRenderClient->Release(); g_pCaptureRenderClient = nullptr; }
+        if (g_pCaptureClient) { g_pCaptureClient->Release(); g_pCaptureClient = nullptr; }
+        if (g_pCaptureDevice) { g_pCaptureDevice->Release(); g_pCaptureDevice = nullptr; }
+        CoTaskMemFree(pwfx);
     }
     
-    g_pCaptureClient->Stop();
-    CoTaskMemFree(pwfx);
     CoUninitialize();
 }
 
-void RenderThreadProc(std::shared_ptr<OutputDevice> pDev) {
-    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+void RouterThreadProc() {
+    std::vector<float> mixBuffer(4800); // 100ms chunk max
     
+    while (g_isRouting) {
+        Sleep(5);
+        // We simulate reading from master timeline.
+        // We peek at how much is available in master buffer.
+        // We don't want to advance read pointer until we distributed it.
+        // But for a true lock-free single-producer single-consumer ring buffer,
+        // we can just read it into a local mix buffer and distribute.
+        
+        size_t readCount = g_masterBuffer->Read(mixBuffer.data(), mixBuffer.size());
+        
+        if (readCount > 0) {
+            std::lock_guard<std::mutex> lock(g_engineMutex);
+            for (auto& dev : g_devices) {
+                if (dev->enabled && dev->isRendering && !dev->deviceFailed) {
+                    dev->ringBuffer->Write(mixBuffer.data(), readCount);
+                }
+            }
+        }
+    }
+}
+
+bool TryInitializeDevice(std::shared_ptr<OutputDevice> pDev) {
+    if (pDev->pRenderClient) { pDev->pRenderClient->Release(); pDev->pRenderClient = nullptr; }
+    if (pDev->pAudioClient) { pDev->pAudioClient->Release(); pDev->pAudioClient = nullptr; }
+    if (pDev->pDevice) { pDev->pDevice->Release(); pDev->pDevice = nullptr; }
+
     HRESULT hr = g_pEnumerator->GetDevice(pDev->id.c_str(), &pDev->pDevice);
-    if (FAILED(hr)) return;
+    if (FAILED(hr)) return false;
     
     hr = pDev->pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&pDev->pAudioClient);
-    if (FAILED(hr)) return;
+    if (FAILED(hr)) return false;
 
+    // Use default float mix format
     WAVEFORMATEX* pMixFormat = nullptr;
-    g_pCaptureClient->GetMixFormat(&pMixFormat); 
+    // Get mix format of the device itself to seed the engine
+    hr = pDev->pAudioClient->GetMixFormat(&pMixFormat);
+    if (FAILED(hr)) return false;
     
     hr = pDev->pAudioClient->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
@@ -331,61 +383,70 @@ void RenderThreadProc(std::shared_ptr<OutputDevice> pDev) {
         
     if (FAILED(hr)) {
         CoTaskMemFree(pMixFormat);
-        return;
+        return false;
     }
     
     hr = pDev->pAudioClient->GetService(__uuidof(IAudioRenderClient), (void**)&pDev->pRenderClient);
-    if (FAILED(hr)) return;
+    CoTaskMemFree(pMixFormat);
     
-    UINT32 bufferFrameCount;
-    pDev->pAudioClient->GetBufferSize(&bufferFrameCount);
-    
-    pDev->pAudioClient->Start();
+    return SUCCEEDED(hr);
+}
+
+void RenderThreadProc(std::shared_ptr<OutputDevice> pDev) {
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
     
     while (pDev->isRendering) {
-        Sleep(5); 
-        
-        UINT32 numFramesPadding;
-        hr = pDev->pAudioClient->GetCurrentPadding(&numFramesPadding);
-        if (FAILED(hr)) continue;
-        
-        UINT32 numFramesAvailable = bufferFrameCount - numFramesPadding;
-        if (numFramesAvailable == 0) continue;
-        
-        BYTE* pData;
-        hr = pDev->pRenderClient->GetBuffer(numFramesAvailable, &pData);
-        if (SUCCEEDED(hr)) {
-            size_t sampleCount = numFramesAvailable * pMixFormat->nChannels;
-            float* pFloatData = (float*)pData;
-            
-            pDev->ringBuffer->Read(pFloatData, sampleCount);
-            
-            float vol = pDev->volume;
-            if (vol != 1.0f) {
-                for (size_t i = 0; i < sampleCount; ++i) {
-                    pFloatData[i] *= vol;
-                }
-            }
-            
-            pDev->pRenderClient->ReleaseBuffer(numFramesAvailable, 0);
+        if (!TryInitializeDevice(pDev)) {
+            pDev->deviceFailed = true;
+            Sleep(2000); // Wait before retry
+            continue;
         }
+        
+        pDev->deviceFailed = false;
+        UINT32 bufferFrameCount;
+        pDev->pAudioClient->GetBufferSize(&bufferFrameCount);
+        pDev->pAudioClient->Start();
+        
+        bool invalidated = false;
+        while (pDev->isRendering && !invalidated) {
+            Sleep(5); 
+            
+            UINT32 numFramesPadding;
+            HRESULT hr = pDev->pAudioClient->GetCurrentPadding(&numFramesPadding);
+            if (hr == AUDCLNT_E_DEVICE_INVALIDATED) { invalidated = true; break; }
+            if (FAILED(hr)) continue;
+            
+            UINT32 numFramesAvailable = bufferFrameCount - numFramesPadding;
+            if (numFramesAvailable == 0) continue;
+            
+            BYTE* pData;
+            hr = pDev->pRenderClient->GetBuffer(numFramesAvailable, &pData);
+            if (hr == AUDCLNT_E_DEVICE_INVALIDATED) { invalidated = true; break; }
+            
+            if (SUCCEEDED(hr)) {
+                size_t sampleCount = numFramesAvailable * CHANNELS;
+                float* pFloatData = (float*)pData;
+                
+                pDev->ringBuffer->Read(pFloatData, sampleCount);
+                
+                float vol = pDev->volume.load();
+                if (vol != 1.0f) {
+                    for (size_t i = 0; i < sampleCount; ++i) {
+                        pFloatData[i] *= vol;
+                    }
+                }
+                
+                hr = pDev->pRenderClient->ReleaseBuffer(numFramesAvailable, 0);
+                if (hr == AUDCLNT_E_DEVICE_INVALIDATED) { invalidated = true; break; }
+            }
+        }
+        
+        pDev->pAudioClient->Stop();
     }
     
-    pDev->pAudioClient->Stop();
+    if (pDev->pRenderClient) { pDev->pRenderClient->Release(); pDev->pRenderClient = nullptr; }
+    if (pDev->pAudioClient) { pDev->pAudioClient->Release(); pDev->pAudioClient = nullptr; }
+    if (pDev->pDevice) { pDev->pDevice->Release(); pDev->pDevice = nullptr; }
     
-    if (pDev->pRenderClient) {
-        pDev->pRenderClient->Release();
-        pDev->pRenderClient = nullptr;
-    }
-    if (pDev->pAudioClient) {
-        pDev->pAudioClient->Release();
-        pDev->pAudioClient = nullptr;
-    }
-    if (pDev->pDevice) {
-        pDev->pDevice->Release();
-        pDev->pDevice = nullptr;
-    }
-    
-    CoTaskMemFree(pMixFormat);
     CoUninitialize();
 }

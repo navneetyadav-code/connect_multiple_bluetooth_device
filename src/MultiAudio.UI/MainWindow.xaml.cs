@@ -48,6 +48,10 @@ namespace MultiAudio.UI
                         {
                             AudioEngine.SetOutputEnabled(device.Id, device.IsEnabled);
                         }
+                        else if (e.PropertyName == nameof(AudioDeviceModel.DelayMs))
+                        {
+                            AudioEngine.SetOutputDelay(device.Id, device.DelayMs);
+                        }
                     };
 
                     Devices.Add(device);
@@ -99,11 +103,22 @@ namespace MultiAudio.UI
     public class AudioDeviceModel : System.ComponentModel.INotifyPropertyChanged
     {
         private bool _isEnabled;
+        private int _delayMs;
+        private string _delayText = "0ms";
 
         public string Id { get; set; } = "";
         public string Name { get; set; } = "";
         public string VolumeText { get; set; } = "";
-        public string DelayText { get; set; } = "";
+        
+        public string DelayText 
+        { 
+            get => _delayText; 
+            set 
+            {
+                _delayText = value;
+                PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(DelayText)));
+            }
+        }
         
         public bool IsEnabled 
         { 
@@ -117,6 +132,22 @@ namespace MultiAudio.UI
                 }
             }
         }
+
+        public int DelayMs
+        {
+            get => _delayMs;
+            set
+            {
+                if (_delayMs != value)
+                {
+                    _delayMs = value;
+                    DelayText = $"{value}ms";
+                    PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(DelayMs)));
+                    PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(DelayText)));
+                }
+            }
+        }
+
 
         public event System.ComponentModel.PropertyChangedEventHandler PropertyChanged;
     }
