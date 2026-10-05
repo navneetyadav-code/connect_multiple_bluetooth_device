@@ -480,3 +480,18 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# Native C++ Build Output
+*.dll
+*.lib
+*.exp
+*.obj
+*.pdb
+*.ilk
+*.suo
+
+# Ignore local output in AudioEngine dir
+src/MultiAudio.AudioEngine/*.dll
+src/MultiAudio.AudioEngine/*.lib
+src/MultiAudio.AudioEngine/*.exp
+src/MultiAudio.AudioEngine/*.obj

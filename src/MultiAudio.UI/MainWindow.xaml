@@ -15,7 +15,10 @@
         </Grid.RowDefinitions>
 
         <!-- Header -->
-        <TextBlock Text="MultiAudio" FontSize="24" FontWeight="Bold" Foreground="White" Margin="0,0,0,10"/>
+        <StackPanel Margin="0,0,0,10">
+            <TextBlock Text="MultiAudio" FontSize="24" FontWeight="Bold" Foreground="White" />
+            <TextBlock Text="Mirrors your default Windows output (System Audio)" Foreground="#AAAAAA" FontStyle="Italic" Margin="0,2,0,0"/>
+        </StackPanel>
 
         <!-- Master Section -->
         <Border Grid.Row="1" Background="#2D2D30" CornerRadius="5" Padding="10" Margin="0,0,0,10">
