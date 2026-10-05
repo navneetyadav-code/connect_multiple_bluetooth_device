@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/MultiAudio.Core/MultiAudio.Core.csproj" />
+    <Project Path="src/MultiAudio.UI/MultiAudio.UI.csproj" />
+  </Folder>
+</Solution>
