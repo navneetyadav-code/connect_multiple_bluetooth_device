@@ -50,6 +50,34 @@ public:
         return to_read;
     }
     
+    size_t Peek(float* data, size_t count) {
+        size_t r = read_pos.load(std::memory_order_relaxed);
+        size_t w = write_pos.load(std::memory_order_acquire);
+        size_t available = w - r;
+        size_t to_read = (count < available) ? count : available;
+        
+        for (size_t i = 0; i < to_read; ++i) {
+            data[i] = buffer[(r + i) & mask];
+        }
+        
+        for (size_t i = to_read; i < count; ++i) {
+            data[i] = 0.0f;
+        }
+        return to_read;
+    }
+    
+    void Advance(size_t count) {
+        size_t r = read_pos.load(std::memory_order_relaxed);
+        r += count;
+        read_pos.store(r, std::memory_order_release);
+    }
+    
+    size_t GetAvailableRead() const {
+        size_t r = read_pos.load(std::memory_order_relaxed);
+        size_t w = write_pos.load(std::memory_order_acquire);
+        return w - r;
+    }
+    
     void Clear() {
         write_pos.store(0, std::memory_order_relaxed);
         read_pos.store(0, std::memory_order_relaxed);
