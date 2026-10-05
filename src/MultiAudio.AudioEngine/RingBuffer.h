@@ -3,7 +3,9 @@
 #include <atomic>
 #include <algorithm>
 
-// Lock-free Single-Producer Single-Consumer ring buffer with monotonic counters.
+// True Lock-free Single-Producer Single-Consumer ring buffer.
+// The Producer NEVER touches read_pos.
+// The Consumer NEVER touches write_pos (only reads it).
 class RingBuffer {
     std::vector<float> buffer;
     std::atomic<size_t> write_pos{ 0 };
@@ -14,13 +16,6 @@ class RingBuffer {
     std::atomic<uint64_t> overflow_count{ 0 };
     std::atomic<uint64_t> underflow_count{ 0 };
     std::atomic<uint64_t> dropped_frames{ 0 };
-
-    void AdvanceReadPosSafe(size_t target_r) {
-        size_t r = read_pos.load(std::memory_order_relaxed);
-        while (r < target_r && !read_pos.compare_exchange_weak(r, target_r, std::memory_order_release, std::memory_order_relaxed)) {
-            // Loop until we successfully advance or another thread advances it past target_r
-        }
-    }
 
 public:
     explicit RingBuffer(size_t size) {
@@ -33,19 +28,13 @@ public:
 
     void Write(const float* data, size_t count) {
         size_t w = write_pos.load(std::memory_order_relaxed);
-        size_t r = read_pos.load(std::memory_order_acquire);
 
-        // Issue #1 Fix: Producer cleanly advances read_pos via CAS if overflow occurs
-        if (w + count - r > capacity) {
-            size_t overflow = (w + count) - (r + capacity);
-            AdvanceReadPosSafe(r + overflow);
-            overflow_count.fetch_add(1, std::memory_order_relaxed);
-            dropped_frames.fetch_add(overflow, std::memory_order_relaxed);
-        }
-
+        // Producer blindly writes. It is the Consumer's responsibility 
+        // to detect if it has been lapped/overwritten.
         for (size_t i = 0; i < count; ++i) {
             buffer[(w + i) & mask] = data[i];
         }
+        
         write_pos.store(w + count, std::memory_order_release);
     }
 
@@ -53,14 +42,37 @@ public:
         size_t r = read_pos.load(std::memory_order_relaxed);
         size_t w = write_pos.load(std::memory_order_acquire);
 
-        size_t available = (w > r) ? (w - r) : 0;
+        // Detect Overrun BEFORE reading
+        if (w - r > capacity) {
+            size_t dropped = (w - r) - capacity;
+            r = w - capacity;
+            overflow_count.fetch_add(1, std::memory_order_relaxed);
+            dropped_frames.fetch_add(dropped, std::memory_order_relaxed);
+        }
+
+        size_t available = w - r;
         size_t to_read   = (count < available) ? count : available;
 
         for (size_t i = 0; i < to_read; ++i) {
             data[i] = buffer[(r + i) & mask];
         }
         
-        AdvanceReadPosSafe(r + to_read);
+        // Detect Torn Read AFTER reading (Producer lapped us while copying)
+        size_t w2 = write_pos.load(std::memory_order_acquire);
+        if (w2 - r > capacity) {
+            // Data is corrupt. Output silence instead of screeching audio.
+            for (size_t i = 0; i < count; ++i) data[i] = 0.0f;
+            
+            size_t dropped = (w2 - r) - capacity;
+            read_pos.store(w2 - capacity, std::memory_order_release);
+            
+            overflow_count.fetch_add(1, std::memory_order_relaxed);
+            dropped_frames.fetch_add(dropped, std::memory_order_relaxed);
+            
+            return count; 
+        }
+
+        read_pos.store(r + to_read, std::memory_order_release);
 
         for (size_t i = to_read; i < count; ++i) {
             data[i] = 0.0f;
@@ -77,29 +89,50 @@ public:
         size_t r = read_pos.load(std::memory_order_relaxed);
         size_t w = write_pos.load(std::memory_order_acquire);
         
-        size_t available = (w > r) ? (w - r) : 0;
+        if (w - r > capacity) {
+            r = w - capacity;
+        }
+
+        size_t available = w - r;
         size_t to_peek   = (count < available) ? count : available;
 
         for (size_t i = 0; i < to_peek; ++i) {
             data[i] = buffer[(r + i) & mask];
         }
         
-        // Don't zero fill peek, let caller handle shortage.
+        size_t w2 = write_pos.load(std::memory_order_acquire);
+        if (w2 - r > capacity) {
+            // Torn peek. Return 0 so caller doesn't use corrupt data.
+            return 0;
+        }
+
         return to_peek;
     }
 
     void Advance(size_t count) {
         size_t r = read_pos.load(std::memory_order_relaxed);
         size_t w = write_pos.load(std::memory_order_acquire);
-        size_t available = (w > r) ? (w - r) : 0;
+        
+        if (w - r > capacity) {
+            size_t dropped = (w - r) - capacity;
+            r = w - capacity;
+            overflow_count.fetch_add(1, std::memory_order_relaxed);
+            dropped_frames.fetch_add(dropped, std::memory_order_relaxed);
+        }
+        
+        size_t available = w - r;
         size_t safe = (count < available) ? count : available;
-        AdvanceReadPosSafe(r + safe);
+        read_pos.store(r + safe, std::memory_order_release);
     }
 
     size_t GetAvailableRead() const {
         size_t r = read_pos.load(std::memory_order_relaxed);
         size_t w = write_pos.load(std::memory_order_acquire);
-        return (w > r) ? (w - r) : 0;
+        
+        if (w - r > capacity) {
+            return capacity;
+        }
+        return w - r;
     }
 
     size_t GetCapacity() const { return capacity; }
