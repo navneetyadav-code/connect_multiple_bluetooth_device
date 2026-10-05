@@ -1,11 +1,30 @@
 {
   "version": 4,
   "targets": {
-    "net10.0-windows": {}
+    "net10.0-windows": {
+      "MultiAudio.Core/1.0.0": {
+        "type": "project",
+        "framework": ".NETCoreApp,Version=v10.0",
+        "compile": {
+          "bin/placeholder/MultiAudio.Core.dll": {}
+        },
+        "runtime": {
+          "bin/placeholder/MultiAudio.Core.dll": {}
+        }
+      }
+    }
   },
-  "libraries": {},
+  "libraries": {
+    "MultiAudio.Core/1.0.0": {
+      "type": "project",
+      "path": "../MultiAudio.Core/MultiAudio.Core.csproj",
+      "msbuildProject": "../MultiAudio.Core/MultiAudio.Core.csproj"
+    }
+  },
   "projectFileDependencyGroups": {
-    "net10.0-windows": []
+    "net10.0-windows": [
+      "MultiAudio.Core >= 1.0.0"
+    ]
   },
   "packageFolders": {
     "C:\\Users\\Ankit Yadav\\.nuget\\packages\\": {}
@@ -32,7 +51,11 @@
         "net10.0-windows": {
           "framework": "net10.0-windows7.0",
           "targetAlias": "net10.0-windows",
-          "projectReferences": {}
+          "projectReferences": {
+            "D:\\Projects\\double_headphone\\MultiAudio\\src\\MultiAudio.Core\\MultiAudio.Core.csproj": {
+              "projectPath": "D:\\Projects\\double_headphone\\MultiAudio\\src\\MultiAudio.Core\\MultiAudio.Core.csproj"
+            }
+          }
         }
       },
       "warningProperties": {
