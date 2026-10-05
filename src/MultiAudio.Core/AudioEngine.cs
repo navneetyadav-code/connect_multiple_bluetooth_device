@@ -24,21 +24,18 @@ namespace MultiAudio.Core
         public static extern void GetDeviceId(int index, StringBuilder idBuffer, int bufferSize);
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void StartCapture();
+        public static extern void StartRouting();
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void StopCapture();
+        public static extern void StopRouting();
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
-        public static extern void AddOutputDevice(string deviceId);
+        public static extern void SetOutputEnabled(string deviceId, bool enabled);
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
-        public static extern void RemoveOutputDevice(string deviceId);
+        public static extern void SetOutputVolume(string deviceId, float volume);
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
-        public static extern void SetDeviceVolume(string deviceId, float volume);
-
-        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
-        public static extern void SetDeviceDelay(string deviceId, int delayMs);
+        public static extern void SetOutputDelay(string deviceId, int delayMs);
     }
 }

@@ -34,14 +34,23 @@ namespace MultiAudio.UI
                     StringBuilder idBuffer = new StringBuilder(256);
                     AudioEngine.GetDeviceId(i, idBuffer, 256);
 
-                    Devices.Add(new AudioDeviceModel
+                    var device = new AudioDeviceModel
                     {
                         Id = idBuffer.ToString(),
                         Name = nameBuffer.ToString(),
                         VolumeText = "🔊 100%",
                         DelayText = "Delay 0ms",
                         IsEnabled = false
-                    });
+                    };
+                    
+                    device.PropertyChanged += (s, e) => {
+                        if (e.PropertyName == nameof(AudioDeviceModel.IsEnabled))
+                        {
+                            AudioEngine.SetOutputEnabled(device.Id, device.IsEnabled);
+                        }
+                    };
+
+                    Devices.Add(device);
                 }
             }
             catch (Exception ex)
@@ -54,14 +63,7 @@ namespace MultiAudio.UI
         {
             try
             {
-                AudioEngine.StartCapture();
-                foreach (var device in Devices)
-                {
-                    if (device.IsEnabled)
-                    {
-                        AudioEngine.AddOutputDevice(device.Id);
-                    }
-                }
+                AudioEngine.StartRouting();
                 
                 StartRoutingButton.IsEnabled = false;
                 StopRoutingButton.IsEnabled = true;
@@ -76,14 +78,7 @@ namespace MultiAudio.UI
         {
             try
             {
-                AudioEngine.StopCapture();
-                foreach (var device in Devices)
-                {
-                    if (device.IsEnabled)
-                    {
-                        AudioEngine.RemoveOutputDevice(device.Id);
-                    }
-                }
+                AudioEngine.StopRouting();
                 
                 StartRoutingButton.IsEnabled = true;
                 StopRoutingButton.IsEnabled = false;
@@ -101,12 +96,28 @@ namespace MultiAudio.UI
         }
     }
 
-    public class AudioDeviceModel
+    public class AudioDeviceModel : System.ComponentModel.INotifyPropertyChanged
     {
+        private bool _isEnabled;
+
         public string Id { get; set; } = "";
         public string Name { get; set; } = "";
         public string VolumeText { get; set; } = "";
         public string DelayText { get; set; } = "";
-        public bool IsEnabled { get; set; }
+        
+        public bool IsEnabled 
+        { 
+            get => _isEnabled;
+            set 
+            {
+                if (_isEnabled != value)
+                {
+                    _isEnabled = value;
+                    PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(IsEnabled)));
+                }
+            }
+        }
+
+        public event System.ComponentModel.PropertyChangedEventHandler PropertyChanged;
     }
 }
