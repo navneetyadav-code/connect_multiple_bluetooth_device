@@ -89,6 +89,7 @@ struct OutputDevice {
     IAudioClient*      pAudioClient  = nullptr;
     IAudioRenderClient* pRenderClient= nullptr;
     WAVEFORMATEX*      pDeviceFormat = nullptr; // owned, freed on cleanup
+    HANDLE             hEvent        = NULL;
 
     std::unique_ptr<RingBuffer> ringBuffer;
     DynamicResampler resampler;
@@ -115,8 +116,10 @@ static IMMDevice*         g_pCaptureDevice       = nullptr;
 static IAudioClient*      g_pCaptureClient        = nullptr;
 static IAudioCaptureClient* g_pCaptureCaptureClient = nullptr;
 static WAVEFORMATEX*      g_pCaptureMixFormat     = nullptr; // owned
+static HANDLE             g_hCaptureEvent         = NULL;
 static std::thread        g_captureThread;
 static std::atomic<bool>  g_isCapturing           { false };
+static HANDLE             g_hRouterEvent          = NULL;
 
 // Forward declarations
 static void CaptureThreadProc();
@@ -218,8 +221,8 @@ void InitializeEngine() {
         (void**)&g_pEnumerator);
     if (FAILED(hr)) return;
 
-    // 2-second master buffer
     g_masterBuffer = std::make_unique<RingBuffer>(ENGINE_SAMPLE_RATE * ENGINE_CHANNELS * 2);
+    g_hRouterEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
 
     IMMDeviceCollection* pCollection = nullptr;
     hr = g_pEnumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &pCollection);
@@ -266,6 +269,7 @@ void ShutdownEngine() {
     std::lock_guard<std::mutex> lock(g_engineMutex);
     g_devices.clear();
     if (g_pEnumerator) { g_pEnumerator->Release(); g_pEnumerator = nullptr; }
+    if (g_hRouterEvent) { CloseHandle(g_hRouterEvent); g_hRouterEvent = NULL; }
     g_masterBuffer.reset();
     CoUninitialize();
 }
@@ -327,31 +331,49 @@ void StopRouting() {
     if (g_captureThread.joinable()) g_captureThread.join();
     if (g_routerThread.joinable())  g_routerThread.join();
 
-    std::lock_guard<std::mutex> lock(g_engineMutex);
-    for (auto& dev : g_devices) {
-        dev->isRendering = false;
-        if (dev->renderThread.joinable()) dev->renderThread.join();
+    std::vector<std::thread> threadsToJoin;
+    {
+        std::lock_guard<std::mutex> lock(g_engineMutex);
+        for (auto& dev : g_devices) {
+            dev->isRendering = false;
+            if (dev->renderThread.joinable()) {
+                threadsToJoin.push_back(std::move(dev->renderThread));
+            }
+        }
     }
+    
+    for (auto& t : threadsToJoin) {
+        if (t.joinable()) t.join();
+    }
+    
     CleanupCapture();
 }
 
 void SetOutputEnabled(const wchar_t* deviceId, bool enabled) {
-    std::lock_guard<std::mutex> lock(g_engineMutex);
-    for (auto& dev : g_devices) {
-        if (dev->id != deviceId) continue;
-        if (dev->enabled == enabled) break;
+    std::thread threadToJoin;
+    
+    {
+        std::lock_guard<std::mutex> lock(g_engineMutex);
+        for (auto& dev : g_devices) {
+            if (dev->id != deviceId) continue;
+            if (dev->enabled == enabled) break;
 
-        dev->enabled = enabled;
-        if (g_isRouting.load()) {
-            if (enabled && !dev->isRendering) {
-                ActivateDevice(dev);
-            } else if (!enabled && dev->isRendering) {
-                dev->isRendering = false;
-                if (dev->renderThread.joinable()) dev->renderThread.join();
+            dev->enabled = enabled;
+            if (g_isRouting.load()) {
+                if (enabled && !dev->isRendering) {
+                    ActivateDevice(dev);
+                } else if (!enabled && dev->isRendering) {
+                    dev->isRendering = false;
+                    if (dev->renderThread.joinable()) {
+                        threadToJoin = std::move(dev->renderThread);
+                    }
+                }
             }
+            break;
         }
-        break;
     }
+    
+    if (threadToJoin.joinable()) threadToJoin.join();
 }
 
 void SetOutputVolume(const wchar_t* deviceId, float volume) {
@@ -375,6 +397,7 @@ static void CleanupCapture() {
     if (g_pCaptureClient)        { g_pCaptureClient->Stop(); g_pCaptureClient->Release(); g_pCaptureClient = nullptr; }
     if (g_pCaptureDevice)        { g_pCaptureDevice->Release(); g_pCaptureDevice = nullptr; }
     if (g_pCaptureMixFormat)     { CoTaskMemFree(g_pCaptureMixFormat); g_pCaptureMixFormat = nullptr; }
+    if (g_hCaptureEvent)         { CloseHandle(g_hCaptureEvent); g_hCaptureEvent = NULL; }
 }
 
 static void CaptureThreadProc() {
@@ -407,9 +430,13 @@ static void CaptureThreadProc() {
         // --- Step 4: Initialize loopback stream ---
         hr = g_pCaptureClient->Initialize(
             AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_LOOPBACK,
-            10000000, 0,
+            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            0, 0,
             g_pCaptureMixFormat, NULL);
+        if (FAILED(hr)) { CleanupCapture(); Sleep(1000); continue; }
+        
+        g_hCaptureEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+        hr = g_pCaptureClient->SetEventHandle(g_hCaptureEvent);
         if (FAILED(hr)) { CleanupCapture(); Sleep(1000); continue; }
 
         // --- Step 5: Get capture service ---
@@ -424,7 +451,8 @@ static void CaptureThreadProc() {
         // --- Capture loop ---
         bool deviceInvalidated = false;
         while (g_isCapturing.load() && !deviceInvalidated) {
-            Sleep(5);
+            DWORD waitResult = WaitForSingleObject(g_hCaptureEvent, 100);
+            if (waitResult != WAIT_OBJECT_0) continue;
 
             UINT32 packetLength = 0;
             hr = g_pCaptureCaptureClient->GetNextPacketSize(&packetLength);
@@ -446,11 +474,13 @@ static void CaptureThreadProc() {
                     size_t count = numFramesAvailable * g_pCaptureMixFormat->nChannels;
                     convertedBuffer.assign(count, 0.0f);
                     g_masterBuffer->Write(convertedBuffer.data(), count);
+                    SetEvent(g_hRouterEvent);
                 } else {
                     // Issue #4 Fix: proper format conversion
                     if (ConvertToFloat(pData, g_pCaptureMixFormat,
                                        numFramesAvailable, convertedBuffer)) {
                         g_masterBuffer->Write(convertedBuffer.data(), convertedBuffer.size());
+                        SetEvent(g_hRouterEvent);
                     }
                     // If format is truly unsupported, we skip silently
                 }
@@ -478,14 +508,15 @@ static void RouterThreadProc() {
     std::vector<float> mixBuffer(ENGINE_SAMPLE_RATE * ENGINE_CHANNELS / 10); // 100 ms
 
     while (g_isRouting.load()) {
-        Sleep(5);
+        DWORD waitResult = WaitForSingleObject(g_hRouterEvent, 100);
+        if (waitResult != WAIT_OBJECT_0) continue;
 
         size_t readCount = g_masterBuffer->Read(mixBuffer.data(), mixBuffer.size());
         if (readCount == 0) continue;
 
-        std::lock_guard<std::mutex> lock(g_engineMutex);
+        // No lock needed! g_devices list length is static during routing.
         for (auto& dev : g_devices) {
-            if (dev->enabled && dev->isRendering && !dev->deviceFailed) {
+            if (dev->enabled.load() && dev->isRendering.load() && !dev->deviceFailed.load()) {
                 dev->ringBuffer->Write(mixBuffer.data(), readCount);
             }
         }
@@ -504,6 +535,7 @@ static void CleanupRenderDevice(std::shared_ptr<OutputDevice> pDev) {
     }
     if (pDev->pDevice)       { pDev->pDevice->Release();      pDev->pDevice       = nullptr; }
     if (pDev->pDeviceFormat) { CoTaskMemFree(pDev->pDeviceFormat); pDev->pDeviceFormat = nullptr; }
+    if (pDev->hEvent)        { CloseHandle(pDev->hEvent);     pDev->hEvent        = NULL; }
 }
 
 static bool TryInitRenderDevice(std::shared_ptr<OutputDevice> pDev) {
@@ -521,8 +553,12 @@ static bool TryInitRenderDevice(std::shared_ptr<OutputDevice> pDev) {
 
     hr = pDev->pAudioClient->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-        10000000, 0, pDev->pDeviceFormat, NULL);
+        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+        0, 0, pDev->pDeviceFormat, NULL); // 0 means default engine period
+    if (FAILED(hr)) { CleanupRenderDevice(pDev); return false; }
+    
+    pDev->hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    hr = pDev->pAudioClient->SetEventHandle(pDev->hEvent);
     if (FAILED(hr)) { CleanupRenderDevice(pDev); return false; }
 
     hr = pDev->pAudioClient->GetService(__uuidof(IAudioRenderClient),
@@ -560,7 +596,12 @@ static void RenderThreadProc(std::shared_ptr<OutputDevice> pDev) {
 
         bool invalidated = false;
         while (pDev->isRendering.load() && !invalidated) {
-            Sleep(5);
+            // Wait for audio event
+            DWORD waitResult = WaitForSingleObject(pDev->hEvent, 100);
+            if (waitResult != WAIT_OBJECT_0) {
+                // timeout or error, continue to check isRendering
+                continue;
+            }
 
             UINT32 padding = 0;
             HRESULT hr = pDev->pAudioClient->GetCurrentPadding(&padding);
@@ -595,7 +636,11 @@ static void RenderThreadProc(std::shared_ptr<OutputDevice> pDev) {
             size_t maxInputFrames = (size_t)((float)framesWanted * ratio) + 2; // +2 = guard
             size_t peekSamples   = maxInputFrames * ENGINE_CHANNELS;
 
-            if (peekSamples > inBuffer.size()) inBuffer.resize(peekSamples);
+            // Issue #8 Fix: never resize in realtime. Clamp to pre-allocated buffer.
+            if (peekSamples > inBuffer.size()) {
+                peekSamples = inBuffer.size();
+                maxInputFrames = peekSamples / ENGINE_CHANNELS;
+            }
 
             size_t samplesPeeked = pDev->ringBuffer->Peek(inBuffer.data(), peekSamples);
             size_t framesPeeked  = samplesPeeked / ENGINE_CHANNELS;
