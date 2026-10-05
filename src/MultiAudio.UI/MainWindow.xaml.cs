@@ -1,7 +1,9 @@
 using System;
 using System.Collections.ObjectModel;
 using System.Text;
+using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Threading;
 using MultiAudio.Core;
 
 namespace MultiAudio.UI
@@ -10,9 +12,15 @@ namespace MultiAudio.UI
     {
         public ObservableCollection<AudioDeviceModel> Devices { get; set; } = new();
 
-        // Issue #7 Fix: all native engine calls are routed through this controller.
+        // All native engine calls are routed through this controller.
         // The WPF dispatcher thread never touches engine state directly.
         private readonly EngineController _engine = new();
+
+        // Keep a strong reference to the callback delegate to prevent GC collection.
+        private AudioEngine.DeviceChangeCallback? _deviceChangeCallback;
+
+        // Debounce timer for device-change notifications (they can fire in bursts)
+        private DispatcherTimer? _deviceRefreshTimer;
 
         public MainWindow()
         {
@@ -20,10 +28,94 @@ namespace MultiAudio.UI
             DataContext = this;
             DevicesList.ItemsSource = Devices;
 
+            // Surface native command failures to the UI
+            _engine.CommandFailed += OnCommandFailed;
+
             // InitializeEngine is read-only device enumeration — safe to call
             // synchronously before any routing threads are started.
-            AudioEngine.InitializeEngine();
+            int hr = AudioEngine.InitializeEngine();
+            if (hr < 0)
+            {
+                StatusText.Text = "⚠ Engine initialization failed";
+                StartRoutingButton.IsEnabled = false;
+                return;
+            }
+
             LoadDevices();
+
+            // Register for device hotplug notifications
+            _deviceChangeCallback = OnNativeDeviceChanged;
+            AudioEngine.SetDeviceChangeCallback(_deviceChangeCallback);
+
+            // Debounce timer: refresh devices at most every 500ms
+            _deviceRefreshTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(500)
+            };
+            _deviceRefreshTimer.Tick += (_, _) =>
+            {
+                _deviceRefreshTimer.Stop();
+                RefreshDeviceList();
+            };
+        }
+
+        /// <summary>
+        /// Called from an arbitrary COM thread when devices change.
+        /// Marshals to the UI thread with debouncing.
+        /// </summary>
+        private void OnNativeDeviceChanged()
+        {
+            Dispatcher.BeginInvoke(() =>
+            {
+                // Restart the debounce timer on each notification
+                _deviceRefreshTimer?.Stop();
+                _deviceRefreshTimer?.Start();
+            });
+        }
+
+        private void RefreshDeviceList()
+        {
+            _engine.Enqueue(() =>
+            {
+                int newCount = AudioEngine.RefreshDevices();
+                if (newCount < 0) return;
+
+                // Marshal device list update back to UI thread
+                Dispatcher.BeginInvoke(() => ReloadDevicesFromNative());
+            });
+        }
+
+        private void ReloadDevicesFromNative()
+        {
+            // Remember which devices were enabled
+            var enabledIds = new System.Collections.Generic.HashSet<string>();
+            foreach (var d in Devices)
+            {
+                if (d.IsEnabled) enabledIds.Add(d.Id);
+            }
+
+            Devices.Clear();
+
+            int count = AudioEngine.GetDeviceCount();
+            for (int i = 0; i < count; i++)
+            {
+                var nameBuffer = new StringBuilder(256);
+                AudioEngine.GetDeviceName(i, nameBuffer, 256);
+
+                var idBuffer = new StringBuilder(256);
+                AudioEngine.GetDeviceId(i, idBuffer, 256);
+
+                var device = new AudioDeviceModel
+                {
+                    Id         = idBuffer.ToString(),
+                    Name       = nameBuffer.ToString(),
+                    VolumeText = "🔊 100%",
+                    IsEnabled  = enabledIds.Contains(idBuffer.ToString())
+                };
+
+                WireDeviceEvents(device);
+                Devices.Add(device);
+            }
         }
 
         private void LoadDevices()
@@ -45,42 +137,94 @@ namespace MultiAudio.UI
                     IsEnabled  = false
                 };
 
-                // Wire property changes — all go through the command queue, never direct
-                device.PropertyChanged += (s, e) =>
-                {
-                    if (e.PropertyName == nameof(AudioDeviceModel.IsEnabled))
-                        _engine.Enqueue(() => AudioEngine.SetOutputEnabled(device.Id, device.IsEnabled));
-
-                    else if (e.PropertyName == nameof(AudioDeviceModel.DelayMs))
-                        _engine.Enqueue(() => AudioEngine.SetOutputDelay(device.Id, device.DelayMs));
-                };
-
+                WireDeviceEvents(device);
                 Devices.Add(device);
             }
         }
 
+        private void WireDeviceEvents(AudioDeviceModel device)
+        {
+            device.PropertyChanged += (s, e) =>
+            {
+                if (e.PropertyName == nameof(AudioDeviceModel.IsEnabled))
+                    _engine.Enqueue(() => AudioEngine.SetOutputEnabled(device.Id, device.IsEnabled));
+
+                else if (e.PropertyName == nameof(AudioDeviceModel.DelayMs))
+                    _engine.Enqueue(() => AudioEngine.SetOutputDelay(device.Id, device.DelayMs));
+            };
+        }
+
         private void StartRoutingButton_Click(object sender, RoutedEventArgs e)
         {
-            // Disable button immediately on the UI thread; the engine command is async
             StartRoutingButton.IsEnabled = false;
             StopRoutingButton.IsEnabled  = true;
-            _engine.Enqueue(AudioEngine.StartRouting);
+            StatusText.Text = "▶ Routing active";
+
+            _engine.Enqueue(() =>
+            {
+                int hr = AudioEngine.StartRouting();
+                if (hr < 0)
+                {
+                    Dispatcher.BeginInvoke(() =>
+                    {
+                        StatusText.Text = $"⚠ Start failed (0x{hr:X8})";
+                        StartRoutingButton.IsEnabled = true;
+                        StopRoutingButton.IsEnabled = false;
+                    });
+                }
+            });
         }
 
         private void StopRoutingButton_Click(object sender, RoutedEventArgs e)
         {
             StopRoutingButton.IsEnabled  = false;
             StartRoutingButton.IsEnabled = true;
-            _engine.Enqueue(AudioEngine.StopRouting);
+            StatusText.Text = "⏹ Stopped";
+            _engine.Enqueue(() => AudioEngine.StopRouting());
         }
 
-        protected override void OnClosed(EventArgs e)
+        /// <summary>
+        /// Surfaces native command errors in the UI status bar.
+        /// </summary>
+        private void OnCommandFailed(Exception ex)
         {
-            // Wait for StopRouting + ShutdownEngine to complete before the process exits
-            _engine.EnqueueAsync(AudioEngine.StopRouting)
-                   .ContinueWith(_ => AudioEngine.ShutdownEngine())
-                   .Wait(TimeSpan.FromSeconds(5));
-            _engine.Dispose();
+            Dispatcher.BeginInvoke(() =>
+            {
+                if (ex is AudioEngineException aex)
+                    StatusText.Text = $"⚠ {aex.Operation}: error 0x{aex.HResult:X8}";
+                else
+                    StatusText.Text = $"⚠ Engine error: {ex.Message}";
+            });
+        }
+
+        /// <summary>
+        /// Issue 8A/8B fix: async shutdown instead of blocking .Wait().
+        /// Uses the Application.Current.Exit event to ensure the process
+        /// doesn't exit before cleanup completes.
+        /// </summary>
+        protected override async void OnClosed(EventArgs e)
+        {
+            StatusText.Text = "Shutting down…";
+
+            // Unregister device notifications first
+            AudioEngine.SetDeviceChangeCallback(null!);
+            _deviceRefreshTimer?.Stop();
+
+            try
+            {
+                // Drain the queue (including StopRouting), then shutdown
+                await _engine.EnqueueAsync(() =>
+                {
+                    AudioEngine.StopRouting();
+                    AudioEngine.ShutdownEngine();
+                });
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Shutdown error: {ex.Message}");
+            }
+
+            await _engine.DisposeAsync();
             base.OnClosed(e);
         }
     }
