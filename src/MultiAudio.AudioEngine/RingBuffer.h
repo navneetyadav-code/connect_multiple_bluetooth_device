@@ -1,45 +1,44 @@
 #pragma once
 #include <vector>
 #include <atomic>
+#include <algorithm>
 
-// Lock-free Single-Producer Single-Consumer ring buffer.
-// Policy: when full, DROP OLDEST data (overwrite) to preserve timing.
-// This is the correct policy for live audio mirroring.
+// Lock-free Single-Producer Single-Consumer ring buffer with monotonic counters.
 class RingBuffer {
     std::vector<float> buffer;
     std::atomic<size_t> write_pos{ 0 };
     std::atomic<size_t> read_pos{ 0 };
-    size_t capacity;  // number of floats
-    size_t mask;      // capacity - 1 (power-of-two)
+    size_t capacity;  
+    size_t mask;      
 
-    // Observable health counters (atomic so render/capture threads can read them freely)
     std::atomic<uint64_t> overflow_count{ 0 };
     std::atomic<uint64_t> underflow_count{ 0 };
     std::atomic<uint64_t> dropped_frames{ 0 };
 
+    void AdvanceReadPosSafe(size_t target_r) {
+        size_t r = read_pos.load(std::memory_order_relaxed);
+        while (r < target_r && !read_pos.compare_exchange_weak(r, target_r, std::memory_order_release, std::memory_order_relaxed)) {
+            // Loop until we successfully advance or another thread advances it past target_r
+        }
+    }
+
 public:
     explicit RingBuffer(size_t size) {
-        // Round up to the next power of two
         size_t powerOfTwo = 1;
         while (powerOfTwo < size) powerOfTwo *= 2;
-
         capacity = powerOfTwo;
         mask     = powerOfTwo - 1;
         buffer.resize(powerOfTwo, 0.0f);
     }
 
-    // Write samples. If buffer would overflow, oldest samples are dropped
-    // to make room, preserving current timing over historical data.
     void Write(const float* data, size_t count) {
         size_t w = write_pos.load(std::memory_order_relaxed);
         size_t r = read_pos.load(std::memory_order_acquire);
 
-        size_t available_space = capacity - (w - r); // unsigned arithmetic handles wrap
-
-        if (count > available_space) {
-            // Drop oldest: advance read pointer to make room
-            size_t overflow = count - available_space;
-            read_pos.fetch_add(overflow, std::memory_order_release);
+        // Issue #1 Fix: Producer cleanly advances read_pos via CAS if overflow occurs
+        if (w + count - r > capacity) {
+            size_t overflow = (w + count) - (r + capacity);
+            AdvanceReadPosSafe(r + overflow);
             overflow_count.fetch_add(1, std::memory_order_relaxed);
             dropped_frames.fetch_add(overflow, std::memory_order_relaxed);
         }
@@ -50,23 +49,19 @@ public:
         write_pos.store(w + count, std::memory_order_release);
     }
 
-    // Read up to `count` samples. Fills remainder with zeros on underflow.
-    // Returns actual samples read.
     size_t Read(float* data, size_t count) {
-        size_t r = write_pos.load(std::memory_order_acquire); // re-read w for freshness
-        size_t w = r;
-        r = read_pos.load(std::memory_order_relaxed);
-        w = write_pos.load(std::memory_order_acquire);
+        size_t r = read_pos.load(std::memory_order_relaxed);
+        size_t w = write_pos.load(std::memory_order_acquire);
 
-        size_t available = w - r;
+        size_t available = (w > r) ? (w - r) : 0;
         size_t to_read   = (count < available) ? count : available;
 
         for (size_t i = 0; i < to_read; ++i) {
             data[i] = buffer[(r + i) & mask];
         }
-        read_pos.store(r + to_read, std::memory_order_release);
+        
+        AdvanceReadPosSafe(r + to_read);
 
-        // Zero-fill any gap
         for (size_t i = to_read; i < count; ++i) {
             data[i] = 0.0f;
         }
@@ -78,40 +73,36 @@ public:
         return to_read;
     }
 
-    // Peek without consuming. Useful for resampler lookahead.
     size_t Peek(float* data, size_t count) const {
         size_t r = read_pos.load(std::memory_order_relaxed);
         size_t w = write_pos.load(std::memory_order_acquire);
-        size_t available = w - r;
+        
+        size_t available = (w > r) ? (w - r) : 0;
         size_t to_peek   = (count < available) ? count : available;
 
         for (size_t i = 0; i < to_peek; ++i) {
             data[i] = buffer[(r + i) & mask];
         }
-        for (size_t i = to_peek; i < count; ++i) {
-            data[i] = 0.0f;
-        }
+        
+        // Don't zero fill peek, let caller handle shortage.
         return to_peek;
     }
 
-    // Advance read pointer by `count` samples (use after Peek + processing).
     void Advance(size_t count) {
         size_t r = read_pos.load(std::memory_order_relaxed);
         size_t w = write_pos.load(std::memory_order_acquire);
-        size_t available = w - r;
-        // Never advance past write pointer
+        size_t available = (w > r) ? (w - r) : 0;
         size_t safe = (count < available) ? count : available;
-        read_pos.store(r + safe, std::memory_order_release);
+        AdvanceReadPosSafe(r + safe);
     }
 
     size_t GetAvailableRead() const {
         size_t r = read_pos.load(std::memory_order_relaxed);
         size_t w = write_pos.load(std::memory_order_acquire);
-        return w - r;
+        return (w > r) ? (w - r) : 0;
     }
 
     size_t GetCapacity() const { return capacity; }
-
     uint64_t GetOverflowCount()   const { return overflow_count.load(std::memory_order_relaxed); }
     uint64_t GetUnderflowCount()  const { return underflow_count.load(std::memory_order_relaxed); }
     uint64_t GetDroppedFrames()   const { return dropped_frames.load(std::memory_order_relaxed); }
